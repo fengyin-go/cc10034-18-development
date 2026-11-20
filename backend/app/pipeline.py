@@ -88,6 +88,13 @@ class PipelineBus:
         self.scd_type3_store: dict[str, dict[str, Any]] = {}  # prev-col
         # 去重状态 — dedup_window 核心存储
         self.dedup_state: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # 窗口恢复 — dedup_window 从历史交付记录文件导入的恢复数据集
+        # 恢复清单：按 (源实例, 来源表, 去重键, 日志文件, 日志位点) 归并的已交付/待核实记录
+        self.recovery_manifest: list[dict[str, Any]] = []
+        # 导入会话：每个交付记录文件一次会话，重复导入只生效一次，中断后可续导
+        self.recovery_imports: list[dict[str, Any]] = []
+        # 中断暂存：尚未核对的原始交付条目（按文件指纹 + 条目序号去重）
+        self.recovery_pending: list[dict[str, Any]] = []
         # 路由规则 — route_dispatcher 核心配置
         self.routing_table: list[dict[str, Any]] = []
         # 过滤规则 — event_filter 核心配置
@@ -114,6 +121,9 @@ class PipelineBus:
             "scd_processed": 0,
             "dedup_hits": 0,
             "backfill_rows": 0,
+            # 窗口恢复重放决定累计值（清单处置状态会被后续重放覆盖，累计值保留历史）
+            "recovery_replay_blocked": 0,
+            "recovery_replay_passed": 0,
         }
 
     def publish_event(self, event: ChangeEventRecord) -> dict[str, Any]:
@@ -199,6 +209,35 @@ class PipelineBus:
                 return True  # 重复
         buffer.append({"event_id": event_id, "ts": now})
         return False
+
+    @staticmethod
+    def recovery_event_identity(source_instance: str, source_table: str,
+                                dedup_key: str, binlog_file: str,
+                                binlog_pos: Any) -> str:
+        """恢复数据集的事件身份：源实例 + 来源表 + 去重键 + 下发位点联合指纹。
+
+        西侧回执与东侧事件即使去重键相同，源实例/位点不同，身份也不同，
+        因此西侧回执不能抵扣东侧来源。
+        """
+        raw = f"{source_instance}|{source_table}|{dedup_key}|{binlog_file}|{binlog_pos}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def recovery_file_fingerprint(file_name: str, content: str) -> str:
+        """交付记录文件指纹：同一文件重复导入只生效一次。"""
+        raw = f"{file_name}:::{content}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+    @staticmethod
+    def window_version(source_instance: str, binlog_file: str, binlog_pos: Any) -> str:
+        """窗口版本：从源实例、文件和日志位置三个源坐标刻画窗口。"""
+        return f"{source_instance}/{binlog_file}@{binlog_pos}"
+
+    def find_recovery_record(self, identity: str) -> dict[str, Any] | None:
+        for record in self.recovery_manifest:
+            if record.get("事件身份") == identity:
+                return record
+        return None
 
     def evaluate_filter(self, event: ChangeEventRecord) -> tuple[bool, list[str]]:
         """评估过滤规则，返回 (是否通过, 匹配规则列表)。"""
@@ -328,6 +367,9 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "recovery_manifest_size": len(self.recovery_manifest),
+            "recovery_import_sessions": len(self.recovery_imports),
+            "recovery_pending_entries": len(self.recovery_pending),
         }
 
 

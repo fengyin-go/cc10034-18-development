@@ -77,5 +77,20 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 去重窗口：从历史交付记录恢复
+
+去重窗口只保留短期滑动状态，故障重启后需要凭历史交付记录恢复。窗口恢复入口
+位于去重窗口页「从交付记录恢复窗口」按钮，或直接访问 `/dedup_window/recovery`。
+
+- 后端领域逻辑：`backend/app/services/window_recovery.py`；
+  接口：`/api/dedup_window/recovery/*`（导入、断点续导、重放核对、恢复清单、暂存区、统计）。
+- 事件身份 = 源实例 + 来源表(source_table) + 去重键 + 下发位点（日志文件+位点）的联合指纹；
+  同键跨源回执（orders-west 对 orders-east）只列出、不抵扣。
+- 已确认回执构成前缀窗口（确认位点 P 认证所有 ≤P 的坐标），未核实（无回执）记录不拦截下发。
+- 文件按内容指纹幂等：重复导入只生效一次；中断条目进入暂存区，可分批续导核对；
+  消费端重放决定（拦截/放行）回写到恢复清单。
+- 端到端核对脚本：`backend/tests/test_window_recovery.py`
+  （`PYTHONPATH=backend backend/.venv/bin/python backend/tests/test_window_recovery.py`）。
+
 领域：数据工程
 子方向：数仓与数据湖
